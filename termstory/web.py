@@ -930,6 +930,7 @@ def generate_and_open_report(
         }}
 
         function formatDuration(seconds) {{
+            if (seconds === null || seconds === undefined) return "Ongoing";
             if (seconds <= 0) return "0s";
             if (seconds < 60) return `${{seconds}}s`;
             const hours = Math.floor(seconds / 3600);
@@ -947,6 +948,7 @@ def generate_and_open_report(
         }}
 
         function formatTime(timestamp) {{
+            if (timestamp === null || timestamp === undefined) return "Active";
             const date = new Date(timestamp * 1000);
             return date.toLocaleTimeString(undefined, {{ hour: '2-digit', minute: '2-digit' }});
         }}
