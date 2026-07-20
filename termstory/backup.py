@@ -46,8 +46,9 @@ def backup_db() -> str:
             oldest = backups.pop(0)
             if os.path.exists(oldest):
                 os.remove(oldest)
-    except OSError as e:
-        logger.warning("Failed to rotate old backups: %s", e)
+    except OSError:
+        # Rotation failure should not crash the backup process, but it must be visible.
+        logger.exception("Failed to rotate old backups in %s", backup_dir)
 
     return backup_path
 
