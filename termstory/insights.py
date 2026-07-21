@@ -206,6 +206,87 @@ def calculate_streak(sessions: List[Session]) -> int:
             break
     return streak
 
+def assign_daily_rpg_class(sessions: List[Session]) -> str:
+    """Assign an RPG class based on command frequency."""
+    import os
+    if not sessions:
+        return "Level 1 Village Peasant"
+        
+    cmd_counts = {}
+    for s in sessions:
+        for cmd in s.commands:
+            cmd_text = cmd.command.strip()
+            if not cmd_text:
+                continue
+            
+            lower_cmd = cmd_text.lower()
+            first_word = cmd_text.split()[0]
+            base_cmd = os.path.basename(first_word).lower()
+            
+            # Special logic for pipes
+            if "|" in cmd_text:
+                base_cmd = "grep" # fallback for regex sorcerer logic
+            
+            # Check expanded commands inside the command text
+            for x in ["docker-compose", "docker", "podman", "git", "gh", "npm", "yarn", "pnpm", "npx", "python3", "python", "pytest", "poetry", "pip", "sqlite3", "psql", "mysql", "mongo", "prisma", "sql", "make", "cmake", "gcc", "clang", "cargo", "rustc", "go", "grep", "awk", "sed"]:
+                if x in lower_cmd.split():
+                    base_cmd = x
+                    break
+                    
+            cmd_counts[base_cmd] = cmd_counts.get(base_cmd, 0) + 1
+            
+    if not cmd_counts:
+        return "Level 1 Village Peasant"
+        
+    top_cmd = max(cmd_counts.items(), key=lambda x: x[1])[0]
+    dominant_count = cmd_counts[top_cmd]
+    
+    # Normalize level based on dominant-class share
+    level = min(100, max(1, dominant_count // 5))
+    
+    class_map = {
+        "docker": "Docker Demolitionist",
+        "docker-compose": "Docker Demolitionist",
+        "podman": "Docker Demolitionist",
+        "git": "Version Control Paladin",
+        "gh": "Version Control Paladin",
+        "grep": "Regex Sorcerer",
+        "awk": "Regex Sorcerer",
+        "sed": "Regex Sorcerer",
+        "python": "Python Pyromancer",
+        "python3": "Python Pyromancer",
+        "pytest": "Python Pyromancer",
+        "poetry": "Python Pyromancer",
+        "pip": "Package Potion Master",
+        "npm": "Frontend Bard",
+        "yarn": "Frontend Bard",
+        "pnpm": "Frontend Bard",
+        "npx": "Frontend Bard",
+        "sqlite3": "Database Necromancer",
+        "psql": "Database Necromancer",
+        "mysql": "Database Necromancer",
+        "mongo": "Database Necromancer",
+        "prisma": "Database Necromancer",
+        "sql": "Database Necromancer",
+        "make": "Systems Ranger",
+        "cmake": "Systems Ranger",
+        "gcc": "Systems Ranger",
+        "clang": "Systems Ranger",
+        "cargo": "Rust Ranger",
+        "rustc": "Rust Ranger",
+        "go": "Go Gladiator",
+        "kubectl": "Kubernetes Knight",
+        "vim": "Vim Vampire",
+        "nvim": "Neovim Ninja",
+        "node": "NodeJS Necromancer",
+        "ls": "Directory Druid",
+        "cd": "Pathfinder Rogue"
+    }
+    
+    archetype = class_map.get(top_cmd, f"Scripting Shaman ({top_cmd})")
+    
+    return f"Level {level} {archetype}"
+
 def analyze_all(db=None) -> Dict:
     """Analyze all recorded history to produce total counts, most active periods,
     most used projects, and current coding streak.
@@ -321,12 +402,14 @@ def analyze_all(db=None) -> Dict:
     sorted_projects = sorted(project_durations.items(), key=lambda x: x[1], reverse=True)
     
     vampire_metrics = get_vampire_metrics(sessions)
+    from termstory.insights import assign_rpg_class
     rpg_info = assign_rpg_class(sessions)
-    
+    rpg_class_str = rpg_info["class_name"]
+
     projects = db.get_all_projects_with_stats()
     necromancer_info = calculate_project_necromancer_score(real_sessions, projects)
     rage_quit_info = calculate_rage_quit_signatures(real_sessions)
-    
+
     return {
         "total_sessions": total_sessions,
         "total_commands": total_commands,
@@ -337,7 +420,7 @@ def analyze_all(db=None) -> Dict:
         "streak": streak,
         "vampire_index": vampire_metrics["vampire_index"],
         "vampire_metrics": vampire_metrics,
-        "rpg_class": rpg_info["class_name"],
+        "rpg_class": rpg_class_str,
         "rpg_info": rpg_info,
         "necromancer_score": necromancer_info["score"],
         "necromancer_info": necromancer_info,
