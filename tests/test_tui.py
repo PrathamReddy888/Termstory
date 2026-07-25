@@ -1598,13 +1598,21 @@ async def test_tui_matrix_defrag_no_extra_ui_panels(monkeypatch):
             auto_ingest_on_mount=True,
         )
 
+        from textual.css.query import NoMatches
+
         async with app.run_test(size=(120, 40)) as pilot:
-            # Wait for the auto-trigger.
+            # Wait for the auto-trigger to fire and install the widget.
             for _ in range(30):
                 await pilot.pause()
                 await asyncio.sleep(0.05)
                 if app._defrag_widget is not None:
                     break
+
+            # Give the mount cycle an extra refresh cycle to complete so the
+            # widget is fully queryable in the DOM. Without this, Python 3.11's
+            # event-loop scheduling can race ahead of Textual's async mount.
+            await pilot.pause()
+            await asyncio.sleep(0.02)
 
             # The DetailsCanvas should be the ONLY place where the MatrixDefragCanvas
             # lives — it must not be added as a sibling modal/screen.
@@ -1612,7 +1620,6 @@ async def test_tui_matrix_defrag_no_extra_ui_panels(monkeypatch):
 
             # The master-layout Grid should still contain exactly the same children
             # (StatsHeader, NavigationTree, DetailsCanvas) — no extra panels.
-            from textual.css.query import NoMatches
             try:
                 stats = app.query_one("#stats-panel")
                 tree = app.query_one("#history-navigator")
@@ -1623,9 +1630,30 @@ async def test_tui_matrix_defrag_no_extra_ui_panels(monkeypatch):
             except NoMatches:
                 pytest.fail("Core layout panels missing during Matrix Defrag animation.")
 
-            # The MatrixDefragCanvas should be a descendant of DetailsCanvas only.
-            details_children = list(details.walk_children())
-            assert any(c is app._defrag_widget for c in details_children)
+            # The MatrixDefragCanvas must be queryable by ID *from the
+            # DetailsCanvas* (i.e. mounted as a descendant, not as a sibling
+            # modal/screen). Using query_one rather than walk_children() is
+            # robust against Textual's internal scroll-container wrapping.
+            try:
+                mounted = details.query_one("#matrix-defrag-canvas")
+            except NoMatches:
+                pytest.fail(
+                    "MatrixDefragCanvas not mounted as a descendant of DetailsCanvas."
+                )
+            assert mounted is app._defrag_widget
+
+            # Negative assertions: the widget must NOT have leaked into sibling
+            # panels (StatsHeader / NavigationTree).
+            try:
+                stats.query_one("#matrix-defrag-canvas")
+                pytest.fail("MatrixDefragCanvas leaked into StatsHeader.")
+            except NoMatches:
+                pass
+            try:
+                tree.query_one("#matrix-defrag-canvas")
+                pytest.fail("MatrixDefragCanvas leaked into NavigationTree.")
+            except NoMatches:
+                pass
 
             # Allow completion so the test tears down cleanly.
             for _ in range(60):
@@ -1633,3 +1661,6 @@ async def test_tui_matrix_defrag_no_extra_ui_panels(monkeypatch):
                 await asyncio.sleep(0.05)
                 if not app._defrag_active:
                     break
+            # Final pause to drain any _finish_defrag cleanup messages before
+            # the test app is torn down (avoids noisy stderr during teardown).
+            await pilot.pause()
