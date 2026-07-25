@@ -602,4 +602,13 @@ def hybrid_search(
     # Sort sessions by hybrid score descending
     scored_sessions.sort(key=lambda x: x["hybrid_score"], reverse=True)
 
-    return scored_sessions
+    # Truncate the ranked pool back down to the requested top_k. The
+    # fallback / semantic-only branches above intentionally pull a larger
+    # candidate pool (`max(effective_top_k, semantic_candidate_k)`, floor
+    # 100) so the semantic ranker has room to surface non-keyword matches
+    # — but the *return* contract of this function is "at most top_k
+    # sessions". Without this final slice, callers that don't re-truncate
+    # (anything other than the CLI's `--limit` path) would receive up to
+    # 100 sessions for zero-keyword / semantic-only queries regardless of
+    # the `top_k` argument.
+    return scored_sessions[:effective_top_k]
