@@ -647,7 +647,6 @@ def detect_late_night_chaotic_sessions(db=None) -> List[Dict]:
     finally:
         conn.close()
 
-
 def calculate_vampire_coder_index(sessions: List[Session]) -> float:
     """Calculate the percentage of commands and commits executed between midnight and 5:00 AM."""
     total_count = 0

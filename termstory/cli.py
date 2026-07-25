@@ -1561,7 +1561,6 @@ def show_rpg_class():
     output = format_rpg_class(rpg_info, bio)
     console.print(Text.from_ansi(output))
 
-
 @app.command("vampire-index")
 def show_vampire_index():
     """Calculate and display your Vampire Coder Index (late-night coding intensity)"""
