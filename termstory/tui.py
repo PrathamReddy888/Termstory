@@ -2051,6 +2051,7 @@ class TermStoryWorkspace(App):
         Binding("question_mark", "show_help", "Help", show=True, key_display="?"),
         Binding("o", "show_onboarding", "Configure AI", show=True, key_display="o"),
         Binding("d", "play_defrag", "Defrag Matrix", show=True, key_display="d"),
+        Binding("m", "play_defrag_ingestion", "Matrix Ingestion", show=True, key_display="m"),
         Binding("p", "play_ghost_playback", "Ghost Playback", show=True, key_display="p"),
         Binding("ctrl+shift+h", "reset_termstory", "Reset App", show=True, key_display="ctrl+shift+h"),
 
@@ -2467,6 +2468,11 @@ class TermStoryWorkspace(App):
         # Setup heatmap pulse micro-animation timer
         self.pulse_phase = 0
         self.set_interval(0.5, self.step_heatmap_pulse)
+
+        # Matrix Defrag ingestion (#41): auto-trigger on first boot / massive batch.
+        # We defer slightly so the initial canvas render completes before we take it over.
+        if self.auto_ingest_on_mount:
+            self.set_timer(0.15, self.start_matrix_defrag_ingestion)
 
     def select_today_or_latest_date_node(self) -> None:
         """Automatically focus/select today's date node or the most recent date node."""
@@ -3182,6 +3188,236 @@ class TermStoryWorkspace(App):
 
     def action_play_defrag(self) -> None:
         self.push_screen(MatrixDefragScreen())
+
+    def action_play_defrag_ingestion(self) -> None:
+        """Manually trigger the Matrix Defrag data-ingestion animation (issue #41).
+
+        Takes over the DetailsCanvas with a cascading Matrix-style stream of
+        raw shell commands and runs the full ingestion pipeline in a background
+        ``@work`` thread. As commands are locked into the SQLite DB, the
+        corresponding lines "snap" to bright white readable text for a split
+        second before scrolling away.
+        """
+        self.start_matrix_defrag_ingestion()
+
+    def start_matrix_defrag_ingestion(self) -> None:
+        """Install the MatrixDefragCanvas into the DetailsCanvas and kick off the
+        background ingestion worker. Safe to call from the UI thread only.
+        """
+        if self._defrag_active:
+            self.notify("Matrix Defrag ingestion already in progress.", severity="warning")
+            return
+        self._defrag_active = True
+
+        try:
+            details = self.query_one("#details-canvas")
+        except Exception as e:
+            logger.debug("Matrix Defrag: DetailsCanvas not found: %s", e)
+            self._defrag_active = False
+            return
+
+        # Take over the DetailsCanvas: clear existing children and mount the matrix widget.
+        details.remove_children()
+        self._defrag_widget = MatrixDefragCanvas(id="matrix-defrag-canvas")
+        details.mount(self._defrag_widget)
+        self._defrag_widget.start()
+        self._defrag_widget.set_status(0)
+
+        # Kick off the ingestion pipeline in a background thread.
+        self.run_ingestion_with_defrag()
+
+    @work(thread=True, exclusive=True)
+    def run_ingestion_with_defrag(self) -> None:
+        """Background worker that drives the ingestion pipeline and feeds the
+        MatrixDefragCanvas with parsed commands. Mirrors ``cli.run_ingestion``
+        but breaks the work into stages so each stage can update the canvas.
+
+        All UI mutations are marshalled onto the UI thread via
+        ``self.call_from_thread`` to respect Textual's threading model.
+        """
+        import time as _time
+
+        widget = self._defrag_widget
+        if widget is None:
+            return
+
+        def ui(fn, *args):
+            """Marshal a UI-thread call from this worker thread."""
+            try:
+                self.call_from_thread(lambda: fn(*args))
+            except Exception as e:
+                logger.debug("Matrix Defrag UI call suppressed: %s", e)
+
+        try:
+            # Local imports keep the module-load cost low and avoid circular imports.
+            from termstory.config import get_history_files
+            from termstory.parser import parse_all_histories
+            from termstory.session import create_sessions
+            from termstory.project import detect_projects
+            from termstory.git_integration import get_project_commits
+            from termstory.tags import auto_tag_all_sessions
+            from termstory.mcp_snapshot import capture_and_store_mcp_snapshot
+            from termstory.reminder import start_sleep_daemon
+            from termstory.date_utils import get_current_time
+            from termstory.cli import discover_project_paths
+
+            # --- Stage 1: scan history files ---
+            ui(widget.set_status, 1)
+            history_files = get_history_files()
+            if not history_files:
+                ui(self._finish_defrag, False, "No shell history files found.")
+                return
+
+            # --- Stage 2: parse + feed commands into the cascading stream ---
+            ui(widget.set_status, 2)
+            commands = parse_all_histories(
+                history_files,
+                db=self.db,
+                project_paths=discover_project_paths(),
+            )
+
+            # Feed parsed commands in batches so the stream visibly cascades.
+            batch_size = 25
+            for i in range(0, len(commands), batch_size):
+                if is_worker_cancelled():
+                    ui(self._finish_defrag, False, "Ingestion cancelled by user.")
+                    return
+                batch_texts = [c.command for c in commands[i:i + batch_size]]
+                ui(widget.feed_commands, batch_texts)
+                # Brief pause so the cascading animation has time to render the batch.
+                _time.sleep(0.04)
+
+            # --- Stage 3: correlate sessions ---
+            ui(widget.set_status, 3)
+            sessions = create_sessions(commands)
+
+            # --- Stage 4: detect projects ---
+            ui(widget.set_status, 4)
+            projects = detect_projects(sessions)
+
+            # --- Stage 5: lock commands into SQLite ---
+            ui(widget.set_status, 5)
+            self.db.save_data(projects, sessions, commands)
+            # As commands have now been persisted via db.save_data(), snap their
+            # visible lines to bright white. We mark them in batches so the
+            # "snap" effect ripples down the stream visually.
+            locked_so_far = 0
+            lock_batch = 20
+            while locked_so_far < len(commands):
+                if is_worker_cancelled():
+                    break
+                this_batch = min(lock_batch, len(commands) - locked_so_far)
+                ui(widget.mark_locked, this_batch)
+                locked_so_far += this_batch
+                _time.sleep(0.05)
+
+            # --- Stage 6: ingest git commits + tags + mcp snapshot + sleep daemon ---
+            # These mirror the tail of cli.run_ingestion so the rest of the
+            # pipeline still runs end-to-end during a Matrix Defrag ingestion.
+            if commands:
+                oldest_ts = commands[0].timestamp
+                since_ts = min(
+                    oldest_ts - 24 * 3600,
+                    int(get_current_time().timestamp()) - 90 * 24 * 3600,
+                )
+            else:
+                since_ts = int(get_current_time().timestamp()) - 90 * 24 * 3600
+
+            is_deep_history = (
+                since_ts < int(get_current_time().timestamp()) - 90 * 24 * 3600
+            )
+            git_timeout = 30 if is_deep_history else 10
+
+            for p in projects:
+                if is_worker_cancelled():
+                    break
+                if p.id is not None and p.path:
+                    try:
+                        commits = get_project_commits(p.path, since_ts, timeout=git_timeout)
+                        if commits:
+                            self.db.save_commits(p.id, commits)
+                    except Exception as git_err:
+                        logger.debug("Matrix Defrag git ingest suppressed: %s", git_err)
+
+            try:
+                auto_tag_all_sessions(self.db)
+            except Exception as tag_err:
+                logger.debug("Matrix Defrag auto-tag suppressed: %s", tag_err)
+
+            try:
+                capture_and_store_mcp_snapshot(self.db)
+            except Exception as mcp_err:
+                logger.debug("Matrix Defrag mcp snapshot suppressed: %s", mcp_err)
+
+            try:
+                start_sleep_daemon(self.db.db_path)
+            except Exception as sleep_err:
+                logger.debug("Matrix Defrag sleep daemon suppressed: %s", sleep_err)
+
+            # --- Stage 7: completion ---
+            ui(widget.mark_finished)
+            _time.sleep(0.8)
+            ui(self._finish_defrag, True, f"{len(commands)} commands locked into SQLite.")
+        except Exception as e:
+            logger.exception("Matrix Defrag ingestion failed: %s", e)
+            ui(self._finish_defrag, False, f"Ingestion error: {e}")
+
+    def _finish_defrag(self, success: bool = True, message: str = "") -> None:
+        """Restore the DetailsCanvas after the Matrix Defrag animation completes.
+
+        Called from the UI thread (marshalled via ``call_from_thread``).
+        """
+        if not self._defrag_active and self._defrag_widget is None:
+            return
+        self._defrag_active = False
+
+        try:
+            widget = self._defrag_widget
+            if widget is not None:
+                widget.stop()
+        except Exception as e:
+            logger.debug("Matrix Defrag widget stop suppressed: %s", e)
+
+        # Reload sessions + projects from the freshly-populated DB so the
+        # restored canvas reflects the just-ingested history.
+        try:
+            if success:
+                if self.days_limit:
+                    start_ts = int((get_current_time() - timedelta(days=self.days_limit)).timestamp())
+                else:
+                    start_ts = 0
+                raw_sessions = self.db.get_range_sessions(start_ts, int(get_current_time().timestamp()))
+                self.sessions = deduplicate_sessions(raw_sessions)
+                project_ids = list(set(s.project_id for s in self.sessions if s.project_id is not None))
+                self.projects = self.db.get_projects_by_ids(project_ids)
+                self.original_sessions = self.sessions
+                self.original_projects = self.projects
+
+                tree = self.query_one("#history-navigator")
+                tree.populate(self.projects, self.sessions)
+                self.update_stats_header()
+
+                if message:
+                    self.notify(f"💚 Matrix Defrag complete — {message}", timeout=4.0)
+                else:
+                    self.notify("💚 Matrix Defrag complete.", timeout=4.0)
+            else:
+                if message:
+                    self.notify(f"Matrix Defrag aborted — {message}", severity="warning", timeout=6.0)
+        except Exception as e:
+            logger.debug("Matrix Defrag finish reload suppressed: %s", e)
+        finally:
+            # Tear down the matrix widget and refresh the underlying canvas.
+            try:
+                details = self.query_one("#details-canvas")
+                details.remove_children()
+            except Exception as e:
+                logger.debug("Matrix Defrag canvas cleanup suppressed: %s", e)
+            self._defrag_widget = None
+            try:
+                self.refresh_details_canvas()
+            except Exception as e:
+                logger.debug("Matrix Defrag refresh suppressed: %s", e)
 
     def action_play_ghost_playback(self) -> None:
         tree = self.query_one("#history-navigator")
