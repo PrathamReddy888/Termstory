@@ -1177,16 +1177,91 @@ def backup_cmd():
     console.print(f"[bold green]✅ Backup created at {escape(backup_path)}[/]")
 
 @app.command("restore")
-def restore_cmd(backup_path: str = typer.Argument(..., help="Path to the backup .db file to restore")):
-    """Restore the TermStory database from a backup file."""
+def restore_cmd(
+    backup_path: str = typer.Argument(..., help="Path to the backup .db file to restore"),
+    yes: bool = typer.Option(
+        False,
+        "--yes", "-y",
+        help="Skip the interactive confirmation prompt (required in non-interactive shells)."
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Print the source backup path and destination database path without performing the restore."
+    ),
+):
+    """Restore the TermStory database from a backup file.
+
+    This command OVERWRITES the live TermStory database at the current
+    `get_db_path()` location with the contents of the supplied backup file.
+    Because a restore is a destructive operation (any sessions, commands,
+    and commits recorded after the backup was taken will be lost), the
+    command follows the same safety pattern as `termstory reset`:
+
+      * In an interactive shell, the user is prompted to confirm and the
+        default is "no" (any response other than `y` / `yes` aborts).
+      * In a non-interactive shell (no TTY on stdin), the command refuses
+        to proceed unless `--yes` is supplied. This prevents scripts and
+        CI pipelines from silently destroying the live database.
+      * `--dry-run` prints the source and destination paths and exits
+        without touching either file.
+
+    Use `--yes` (or `-y`) to skip the prompt in automation.
+    """
     from termstory.backup import restore_db
     from rich.markup import escape
+    import os as _os
+
+    # Validate the backup file exists BEFORE prompting. A mistyped path
+    # should produce a clear "file not found" error, not a confirmation
+    # prompt that the user might blindly accept.
+    if not _os.path.isfile(backup_path):
+        console.print(f"[bold red]Error: backup file not found at {escape(backup_path)}[/]")
+        raise typer.Exit(code=1)
+
+    live_db_path = get_db_path()
+
+    # Always show the user exactly what is about to happen, in both
+    # interactive and non-interactive modes. This makes accidental
+    # restores from the wrong backup file much less likely.
+    console.print("[bold red]WARNING: this will overwrite your live TermStory database.[/bold red]")
+    console.print(f"  [cyan]source (backup):[/cyan] {escape(backup_path)}")
+    console.print(f"  [cyan]target (live):[/cyan]  {escape(live_db_path)}")
+
+    if dry_run:
+        console.print("\n[yellow]Dry run complete. No files were modified.[/yellow]")
+        return
+
+    if not yes:
+        # A non-interactive shell can't answer the prompt; refuse instead
+        # of silently aborting with a success exit code. This mirrors the
+        # safety pattern in `perform_reset`.
+        if not sys.stdin.isatty():
+            console.print(
+                "[bold red]Refusing to restore in a non-interactive shell without --yes.[/bold red]"
+            )
+            raise typer.Exit(code=1)
+        try:
+            response = input(
+                "\nOverwrite the live database with this backup? [y/N]: "
+            ).strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            console.print("\n[red]Restore cancelled by user interruption.[/red]")
+            raise typer.Exit(code=1)
+        if response not in ("y", "yes"):
+            console.print("[yellow]Restore aborted.[/yellow]")
+            return
+
     try:
         restore_db(backup_path)
-        console.print(f"[bold green]✅ Database restored from {escape(backup_path)}[/]")
     except FileNotFoundError as e:
+        # restore_db re-checks file existence; preserve the existing
+        # error-handling contract in case the file disappeared between
+        # our preflight check and the actual restore call.
         console.print(f"[bold red]Error: {escape(str(e))}[/]")
         raise typer.Exit(code=1)
+
+    console.print(f"[bold green]✅ Database restored from {escape(backup_path)}[/]")
 
 
 
