@@ -1748,6 +1748,217 @@ class MatrixDefragScreen(_DeferredDismissMixin, ModalScreen[None]):
                 self.animation_timer.stop()
             self.set_timer(0.8, self.dismiss)
 
+class MatrixDefragCanvas(Static):
+    """Matrix-style cascading data-stream widget that takes over the DetailsCanvas
+    during shell-history ingestion.
+
+    Visually replaces the standard progress bar with a cascading Matrix-style stream
+    of raw shell commands interlaced with hex codes in dim green/cyan. As the
+    Parser Engine locks commands into the SQLite DB via ``db.save_data()``, the
+    corresponding visible lines "snap" into bright white readable text for a
+    split second before scrolling away, giving a visceral hacker-movie feel to
+    the ingestion process and visualizing the engine crunching through thousands
+    of lines without adding any extra UI panels.
+
+    Thread-safety contract
+    ----------------------
+    The ingestion pipeline runs inside a ``@work(thread=True)`` worker on a
+    background thread. The worker feeds commands into this widget via
+    ``feed_commands`` / ``mark_locked`` / ``set_status`` calls marshalled onto
+    the UI thread by the parent ``TermStoryWorkspace`` through
+    ``app.call_from_thread``. The widget itself only mutates its own state from
+    the UI thread (driven by ``set_interval``), so no locking is required.
+    """
+
+    DEFAULT_CSS = """
+    MatrixDefragCanvas {
+        background: #050a05;
+        color: #00ff66;
+        padding: 0 1;
+        height: 100%;
+        width: 1fr;
+    }
+    """
+
+    # Number of visible lines kept in the cascading stream.
+    MAX_VISIBLE_LINES = 32
+    # How many ticks a line stays "snapped" bright-white before fading back to dim.
+    LOCKED_HOLD_TICKS = 6
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        import random
+        from collections import deque
+        self._random = random
+        self._lines = deque(maxlen=self.MAX_VISIBLE_LINES)
+        self._pending_commands = deque()
+        self._total_fed = 0
+        self._total_locked = 0
+        self._animation_timer = None
+        self._hex_alphabet = "0123456789ABCDEF"
+        self._status_messages = [
+            "INITIALIZING PARSER ENGINE...",
+            "SCANNING SHELL HISTORY FILES...",
+            "PARSING TIMESTAMPS & COMMANDS...",
+            "CORRELATING SESSIONS...",
+            "DETECTING PROJECTS...",
+            "LOCKING COMMANDS INTO SQLITE DB...",
+            "DEFRAG COMPLETE.",
+        ]
+        self._status_idx = 0
+        self._finished = False
+
+    # ---------------- Public API (called from UI thread) -----------------
+
+    def start(self) -> None:
+        """Begin the cascading animation timer."""
+        if self._animation_timer is None:
+            self._animation_timer = self.set_interval(0.06, self._tick)
+
+    def stop(self) -> None:
+        """Stop the cascading animation timer."""
+        if self._animation_timer is not None:
+            try:
+                self._animation_timer.stop()
+            except Exception as e:
+                logger.debug("MatrixDefragCanvas stop suppressed: %s", e)
+            self._animation_timer = None
+
+    def feed_commands(self, command_texts: List[str]) -> None:
+        """Feed a batch of parsed command strings into the pending queue.
+
+        Called from the UI thread (marshalled via ``app.call_from_thread``).
+        """
+        for cmd_text in command_texts:
+            self._pending_commands.append(cmd_text)
+        self._total_fed += len(command_texts)
+
+    def mark_locked(self, count: int) -> None:
+        """Mark ``count`` of the currently visible command lines as locked
+        (bright white "snap"). Called from the UI thread after the Parser
+        Engine has flushed a batch to SQLite.
+        """
+        marked = 0
+        # Walk newest → oldest, locking the first non-filler, non-locked line.
+        for line in reversed(self._lines):
+            if marked >= count:
+                break
+            if line.get("is_filler"):
+                continue
+            if line.get("locked_age") is not None:
+                continue
+            line["locked_age"] = 0
+            marked += 1
+            self._total_locked += 1
+
+    def set_status(self, idx: int) -> None:
+        """Advance the status banner index (clamped to the status list)."""
+        self._status_idx = max(0, min(idx, len(self._status_messages) - 1))
+
+    def mark_finished(self) -> None:
+        """Mark the animation as logically complete (final status + stop timer)."""
+        self._finished = True
+        self._status_idx = len(self._status_messages) - 1
+
+    # ---------------- Internal animation loop -----------------
+
+    def _make_hex_token(self, length: int = 8) -> str:
+        """Generate a random hex token of the given length."""
+        return "0x" + "".join(self._random.choice(self._hex_alphabet) for _ in range(length))
+
+    def _tick(self) -> None:
+        """Advance the cascading stream by one frame."""
+        # 1. Promote a few pending commands into visible stream lines.
+        promoted = 0
+        max_promote = 3
+        while self._pending_commands and promoted < max_promote:
+            raw_cmd = self._pending_commands.popleft()
+            # Escape Rich markup so commands like `git commit -m "[fix]"` don't break rendering.
+            safe_cmd = escape(str(raw_cmd))
+            if len(safe_cmd) > 72:
+                safe_cmd = safe_cmd[:69] + "..."
+            self._lines.append({
+                "text": safe_cmd,
+                "hex": self._make_hex_token(8),
+                "locked_age": None,
+                "is_filler": False,
+            })
+            promoted += 1
+
+        # 2. Occasionally drop a pure hex filler line for the matrix aesthetic
+        #    (only when we don't have pending commands to display).
+        if not self._pending_commands and self._random.random() < 0.35 and len(self._lines) < self.MAX_VISIBLE_LINES:
+            self._lines.append({
+                "text": "",
+                "hex": self._make_hex_token(8) + " " + self._make_hex_token(6),
+                "locked_age": None,
+                "is_filler": True,
+            })
+
+        # 3. Age all currently-locked lines so they fade back to dim after a few ticks.
+        for line in self._lines:
+            if line.get("locked_age") is not None:
+                line["locked_age"] += 1
+
+        # 4. Render the current frame.
+        self._render_frame()
+
+    def _render_frame(self) -> None:
+        """Render the visible stream + status banner as a Rich Text and update the widget."""
+        text = Text()
+
+        # Header banner.
+        text.append("╔════════════════════════════════════════════════════════════════╗\n",
+                    style="bold green")
+        text.append("║      💚 TERMSTORY // MATRIX DEFRAG — DATA INGESTION STREAM       ║\n",
+                    style="bold green")
+        text.append("╚════════════════════════════════════════════════════════════════╝\n\n",
+                    style="bold green")
+
+        # Status banner + counters.
+        status = self._status_messages[self._status_idx]
+        text.append(f">> {status}", style="bold cyan")
+        text.append("    ", style="")
+        text.append(f"[INGESTED: {self._total_fed}]", style="dim cyan")
+        text.append(" ", style="")
+        text.append(f"[LOCKED: {self._total_locked}]\n\n", style="bold white")
+
+        # Cascading stream — newest at the bottom.
+        for line in self._lines:
+            locked_age = line.get("locked_age")
+            is_filler = line.get("is_filler", False)
+            hex_token = line.get("hex", "")
+            line_text = line.get("text", "")
+
+            if locked_age is not None and locked_age < self.LOCKED_HOLD_TICKS:
+                # "Snapped" line — bright white, briefly, on a faint green background.
+                text.append(f"  ▸ {hex_token}  ", style="bold green")
+                text.append(f"{line_text}\n", style="bold white on #0a2a0a")
+            elif locked_age is not None and locked_age < self.LOCKED_HOLD_TICKS + 4:
+                # Fade out: still readable but dimmed.
+                text.append(f"  {hex_token}  ", style="green")
+                text.append(f"{line_text}\n", style="bright_green")
+            elif is_filler:
+                # Pure hex filler line.
+                text.append(f"  {hex_token}\n", style="dim green")
+            else:
+                # Standard dim green/cyan stream line.
+                color = "green" if self._random.random() < 0.7 else "cyan"
+                text.append(f"  {hex_token}  ", style="dim " + color)
+                text.append(f"{line_text}\n", style=color)
+
+        # Footer hint.
+        text.append("\n")
+        if self._finished:
+            text.append("[bold green]>> Ingestion pipeline complete. Restoring DetailsCanvas...[/bold green]\n")
+        else:
+            text.append("[dim]Parser Engine crunching history — cascading data stream in progress...[/dim]\n")
+
+        try:
+            self.update(text)
+        except Exception as e:
+            logger.debug("MatrixDefragCanvas render suppressed: %s", e)
+
 
 class GhostTyperScreen(_DeferredDismissMixin, ModalScreen[None]):
     """Cyberpunk Ghost Typer playback simulator."""
@@ -2117,7 +2328,7 @@ class TermStoryWorkspace(App):
     }
     """
     
-    def __init__(self, db: Database, days_limit: Optional[int] = 90, config_override: Optional[dict] = None):
+    def __init__(self, db: Database, days_limit: Optional[int] = 90, config_override: Optional[dict] = None, auto_ingest_on_mount: bool = False):
         super().__init__()
         self.db = db
         self.days_limit = days_limit
@@ -2132,6 +2343,13 @@ class TermStoryWorkspace(App):
         self.generating_session_stories = set()
         self.was_reset = False
         self.auto_select_today_on_mount = True
+        # Matrix Defrag ingestion animation (#41):
+        # When True, the TUI takes over the DetailsCanvas with the cascading
+        # Matrix-style stream and runs the ingestion pipeline in a background
+        # @work thread instead of expecting cli.run_ingestion() to have already run.
+        self.auto_ingest_on_mount = auto_ingest_on_mount
+        self._defrag_active = False
+        self._defrag_widget = None
 
 
         
