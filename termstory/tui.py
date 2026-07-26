@@ -244,14 +244,17 @@ def calculate_dashboard_stats(
     projects: List[Project],
     days_limit: int = 30,
     pulse_phase: int = 0,
+    highlight_days: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Calculate cumulative dashboard stats.
 
     Issue #42 additions:
       * ``highlight_days`` — set of dates that should pulse magenta→neon-pink
         in the heatmap (personal-best command counts OR 8+ hour continuous
-        sessions). Computed via :func:`_compute_highlight_days` and forwarded
-        to :func:`generate_heatmap`.
+        sessions). If passed as ``None`` (default), it is computed via
+        :func:`_compute_highlight_days`. Callers that invoke this function
+        on every pulse tick (e.g. ``update_stats_header``) should cache the
+        set and pass it in to avoid re-iterating all sessions every 0.5s.
       * ``pulse_active`` — True when the current ``pulse_phase`` tick should
         visibly pulse the highlighted days AND the "Time logged" text in the
         StatsHeader. Flips every tick (so 1s full cycle), matching the
@@ -264,13 +267,13 @@ def calculate_dashboard_stats(
         for s in real_sessions
     }
 
-    # Issue #42: per-day command counts are needed both by generate_heatmap()
-    # and by _compute_highlight_days(). Compute once, reuse.
-    day_counts = defaultdict(int)
-    for s in real_sessions:
-        day_counts[datetime.fromtimestamp(s.start_time).date()] += len(s.commands)
-
-    highlight_days = _compute_highlight_days(day_counts, real_sessions)
+    # Issue #42: compute highlight_days only if the caller didn't supply a
+    # cached set. This lets the pulse-tick hot path skip the O(n) iteration.
+    if highlight_days is None:
+        day_counts = defaultdict(int)
+        for s in real_sessions:
+            day_counts[datetime.fromtimestamp(s.start_time).date()] += len(s.commands)
+        highlight_days = _compute_highlight_days(day_counts, real_sessions)
 
     streak = calculate_streak(real_sessions)
     total_seconds = sum(s.duration_seconds for s in sessions)
@@ -281,6 +284,35 @@ def calculate_dashboard_stats(
         pulse_phase=pulse_phase,
         highlight_days=highlight_days,
     )
+
+    # Pulse is "active" on odd ticks — this matches the neon-pink frame in
+    # generate_heatmap(). The StatsHeader reads this to colour the "Time
+    # logged" text in sync with the highlighted heatmap blocks.
+    pulse_active = bool(highlight_days) and (pulse_phase % 2 == 1)
+
+    # Derive last ingestion time from the most recently ended session
+    last_ingestion_str = ""
+    if sessions:
+        latest_ts = max(s.end_time for s in sessions)
+        last_ingestion_str = datetime.fromtimestamp(latest_ts).strftime("%b %d %H:%M")
+
+    from termstory.insights import calculate_vampire_coder_index, assign_daily_rpg_class
+    vamp_index = calculate_vampire_coder_index(sessions)
+    rpg_class_str = assign_daily_rpg_class(sessions)
+
+    return {
+        "total_time": total_time_str,
+        "active_days": len(active_dates),
+        "streak": streak,
+        "projects_count": len(projects),
+        "heatmap": heatmap,
+        "last_ingestion": last_ingestion_str,
+        "vampire_index": vamp_index,
+        "rpg_class": rpg_class_str,
+        # Issue #42:
+        "highlight_days": highlight_days,
+        "pulse_active": pulse_active,
+    }
 
     # Pulse is "active" on odd ticks — this matches the neon-pink frame in
     # generate_heatmap(). The StatsHeader reads this to colour the "Time
