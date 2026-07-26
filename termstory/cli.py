@@ -917,13 +917,56 @@ def perform_reset(auto_confirm: bool = False, dry_run: bool = False):
 def show_ui(
     days: int = typer.Option(90, "--days", help="Number of days of history to display"),
     all_history: bool = typer.Option(False, "--all", help="Display all recorded history"),
+    matrix: bool = typer.Option(
+        False,
+        "--matrix",
+        help="Force the Matrix Defrag data-ingestion animation on this boot (issue #41).",
+    ),
 ):
     """Launch the interactive terminal dashboard user interface"""
     db_path = get_db_path()
     db = Database(db_path)
     safe_init_db(db)
-    
-    run_ingestion(db)
+
+    # --- Matrix Defrag auto-trigger detection (issue #41) ---
+    # Auto-trigger the cascading Matrix-style ingestion animation when:
+    #   1. The user explicitly requests it via `--matrix`, OR
+    #   2. The DB has 0 commands (first boot), OR
+    #   3. The history file(s) are unusually large (massive batch ingestion).
+    # When auto-triggering, we skip the synchronous cli.run_ingestion() call
+    # and instead let the TUI drive ingestion via its background @work thread
+    # while the Matrix animation takes over the DetailsCanvas.
+    should_auto_ingest = matrix
+    if not should_auto_ingest:
+        try:
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM commands")
+            existing_cmd_count = cursor.fetchone()[0]
+            if existing_cmd_count == 0:
+                should_auto_ingest = True
+        except Exception:
+            # If we can't query the DB (e.g. fresh schema), fall back to standard ingestion.
+            pass
+
+    if not should_auto_ingest:
+        # Heuristic: a "massive batch" is roughly any single history file > 1 MB.
+        # In that case we also hand off to the TUI so the user gets the Matrix
+        # animation rather than a long blocking CLI pause.
+        try:
+            from termstory.config import get_history_files
+            history_files = get_history_files()
+            if history_files and any(
+                os.path.exists(p) and os.path.getsize(p) > 1_000_000
+                for p in history_files
+            ):
+                should_auto_ingest = True
+        except Exception:
+            pass
+
+    if not should_auto_ingest:
+        # Standard synchronous ingestion path (existing behavior).
+        run_ingestion(db)
     
     # White-Glove Onboarding Prompt:
     # If the parser flags that shell history timestamps are missing, pause the standard
@@ -1000,7 +1043,11 @@ def show_ui(
             console.print("Invalid response. Continuing with legacy history fallback...")
             
     from termstory.tui import TermStoryWorkspace
-    app_tui = TermStoryWorkspace(db, days_limit=None if all_history else days)
+    app_tui = TermStoryWorkspace(
+        db,
+        days_limit=None if all_history else days,
+        auto_ingest_on_mount=should_auto_ingest,
+    )
     app_tui.run()
     
     if getattr(app_tui, "was_reset", False):

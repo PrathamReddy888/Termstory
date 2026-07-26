@@ -11,6 +11,7 @@ from termstory.database import Database
 from termstory.models import Command, Project, Session
 from termstory.tui import (
     HelpScreen,
+    MatrixDefragCanvas,
     OnboardingScreen,
     TermStoryWorkspace,
     calculate_dashboard_stats,
@@ -1328,3 +1329,338 @@ async def test_reset_action():
             await pilot.pause()
             app.was_reset = True
             assert app.was_reset is True
+# =============================================================================
+# Issue #41 — "The Matrix Defrag" (Data Ingestion Animation)
+#
+# Tests follow the pattern of test_tui_batch_8_cyberpunk_animations and verify:
+#   1. The animation auto-triggers on first boot (empty DB) via auto_ingest_on_mount.
+#   2. The DetailsCanvas renders a cascading Matrix-style stream of raw shell
+#      commands interlaced with hex codes in dim green/cyan.
+#   3. As commands are locked into the SQLite DB via db.save_data(), specific
+#      lines "snap" into bright white readable text for a split second.
+#   4. The animation completes cleanly and restores the DetailsCanvas without
+#      leaving orphan UI panels.
+# =============================================================================
+
+
+@pytest.mark.asyncio
+async def test_matrix_defrag_canvas_renders_cascading_stream():
+    """MatrixDefragCanvas renders fed commands as a cascading stream interlaced
+    with hex codes. The status banner shows the current pipeline stage and the
+    INGESTED counter increments as commands are fed.
+    """
+    canvas = MatrixDefragCanvas(id="matrix-defrag-canvas")
+
+    # Feed a small batch of commands before any rendering — they should land
+    # in the pending queue and be promoted into the visible stream on _tick.
+    canvas.feed_commands([
+        "git commit -m 'feat: matrix defrag'",
+        "pytest tests/test_tui.py -k matrix",
+        "git push origin main",
+    ])
+
+    # Advance the animation a few frames so pending commands get promoted.
+    # _tick mutates internal state without requiring a textual app context.
+    for _ in range(5):
+        canvas._tick()
+
+    # INGESTED counter must reflect the 3 fed commands.
+    assert canvas._total_fed == 3
+    # Status banner is at stage 0 (INITIALIZING) by default.
+    assert canvas._status_idx == 0
+    # The pending queue should have been drained by the ticks.
+    assert len(canvas._pending_commands) == 0
+    # The visible lines deque should now contain at least one non-filler line
+    # carrying the actual command text.
+    non_filler_lines = [l for l in canvas._lines if not l.get("is_filler")]
+    assert len(non_filler_lines) >= 1
+    assert any("git commit" in l["text"] for l in non_filler_lines)
+    # Every visible line must carry an 8-char hex token prefixed with '0x'.
+    for line in canvas._lines:
+        assert line["hex"].startswith("0x")
+        assert len(line["hex"]) >= 10  # '0x' + 8 hex chars
+
+
+@pytest.mark.asyncio
+async def test_matrix_defrag_canvas_snaps_lines_to_white_on_lock():
+    """When mark_locked(count) is called after db.save_data(), the corresponding
+    visible lines transition from dim-green 'pending' state to bright-white
+    'locked' state (locked_age=0) for the LOCKED_HOLD_TICKS duration.
+    """
+    canvas = MatrixDefragCanvas(id="matrix-defrag-canvas")
+    canvas.feed_commands(["ls -la", "cd ~/code", "vim README.md"])
+
+    # Promote commands into visible stream.
+    for _ in range(3):
+        canvas._tick()
+
+    locked_before = canvas._total_locked
+    # Lock the 3 visible command lines (simulating db.save_data() completion).
+    canvas.mark_locked(3)
+    locked_after = canvas._total_locked
+
+    assert locked_after - locked_before == 3
+
+    # All non-filler visible lines should now be in the "snapped" state.
+    for line in canvas._lines:
+        if not line.get("is_filler"):
+            assert line["locked_age"] is not None
+            assert line["locked_age"] == 0
+
+    # Advance past LOCKED_HOLD_TICKS + 4 ticks — the locked lines should still
+    # be tracked but their locked_age should have advanced, simulating the
+    # "split second before scrolling away" fade-out behavior.
+    for _ in range(MatrixDefragCanvas.LOCKED_HOLD_TICKS + 4):
+        canvas._tick()
+
+    # All visible locked lines should now have aged beyond the snap window.
+    for line in canvas._lines:
+        if line.get("locked_age") is not None:
+            assert line["locked_age"] > MatrixDefragCanvas.LOCKED_HOLD_TICKS
+
+
+@pytest.mark.asyncio
+async def test_tui_matrix_defrag_auto_triggers_on_first_boot(monkeypatch):
+    """When TermStoryWorkspace is constructed with auto_ingest_on_mount=True
+    (first-boot detection in cli.show_ui), the DetailsCanvas should be taken
+    over by the MatrixDefragCanvas within a short delay after on_mount.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = os.path.join(tmp_dir, "test.db")
+        db = Database(db_path)
+        db.init_db()
+
+        # Stub the ingestion pipeline so we don't depend on real shell history.
+        # We make parse_all_histories return a small batch of commands so the
+        # cascading stream has content to display.
+        from termstory.models import Command as TSCmd
+        fake_commands = [
+            TSCmd(timestamp=1700000000 + i, command=f"echo cmd_{i}", exit_code=0)
+            for i in range(15)
+        ]
+
+        # Stub the ingestion pipeline at its original module paths so the
+        # late-bound imports inside run_ingestion_with_defrag() pick up the stubs.
+        monkeypatch.setattr(
+            "termstory.parser.parse_all_histories",
+            lambda *a, **kw: fake_commands,
+        )
+        monkeypatch.setattr(
+            "termstory.session.create_sessions",
+            lambda cmds: [],
+        )
+        monkeypatch.setattr(
+            "termstory.project.detect_projects",
+            lambda sessions: [],
+        )
+        monkeypatch.setattr(
+            "termstory.config.get_history_files",
+            lambda: ["/tmp/fake_zsh_history"],
+        )
+        monkeypatch.setattr(
+            "termstory.cli.discover_project_paths",
+            lambda: [],
+        )
+        # Stub the post-save side effects so we don't spawn daemons in tests.
+        monkeypatch.setattr("termstory.git_integration.get_project_commits", lambda *a, **kw: [], )
+        monkeypatch.setattr("termstory.tags.auto_tag_all_sessions", lambda db: None)
+        monkeypatch.setattr("termstory.mcp_snapshot.capture_and_store_mcp_snapshot", lambda db: None)
+        monkeypatch.setattr("termstory.reminder.start_sleep_daemon", lambda db_path: None)
+
+        app = TermStoryWorkspace(
+            db,
+            days_limit=30,
+            config_override={"has_seen_onboarding": True, "ai_enabled": False},
+            auto_ingest_on_mount=True,
+        )
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Wait for the deferred auto-trigger (set_timer(0.15, ...)) plus
+            # a few ingestion stages to fire.
+            for _ in range(30):
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                if app._defrag_widget is not None:
+                    break
+
+            # The MatrixDefragCanvas should have been mounted into the DetailsCanvas.
+            assert app._defrag_active is True
+            assert app._defrag_widget is not None
+            assert isinstance(app._defrag_widget, MatrixDefragCanvas)
+
+            # Allow the ingestion worker to fully complete and restore the canvas.
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                if not app._defrag_active:
+                    break
+
+            # After completion, the defrag widget should be torn down and the
+            # DetailsCanvas restored to its normal empty/welcome state.
+            assert app._defrag_active is False
+            assert app._defrag_widget is None
+
+            # The 15 fake commands should have been persisted to the DB.
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM commands")
+            assert cursor.fetchone()[0] == 15
+
+
+@pytest.mark.asyncio
+async def test_tui_matrix_defrag_manual_trigger_via_keybinding(monkeypatch):
+    """Pressing 'm' in the TUI triggers the Matrix Defrag ingestion animation
+    manually, even when auto_ingest_on_mount is False.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = os.path.join(tmp_dir, "test.db")
+        db = Database(db_path)
+        db.init_db()
+
+        from termstory.models import Command as TSCmd
+        fake_commands = [
+            TSCmd(timestamp=1700000000 + i, command=f"echo manual_{i}", exit_code=0)
+            for i in range(5)
+        ]
+
+        monkeypatch.setattr("termstory.parser.parse_all_histories", lambda *a, **kw: fake_commands)
+        monkeypatch.setattr("termstory.session.create_sessions", lambda cmds: [])
+        monkeypatch.setattr("termstory.project.detect_projects", lambda sessions: [])
+        monkeypatch.setattr("termstory.config.get_history_files", lambda: ["/tmp/fake_zsh_history"])
+        monkeypatch.setattr("termstory.cli.discover_project_paths", lambda: [])
+        monkeypatch.setattr("termstory.git_integration.get_project_commits", lambda *a, **kw: [])
+        monkeypatch.setattr("termstory.tags.auto_tag_all_sessions", lambda db: None)
+        monkeypatch.setattr("termstory.mcp_snapshot.capture_and_store_mcp_snapshot", lambda db: None)
+        monkeypatch.setattr("termstory.reminder.start_sleep_daemon", lambda db_path: None)
+
+        app = TermStoryWorkspace(
+            db,
+            days_limit=30,
+            config_override={"has_seen_onboarding": True, "ai_enabled": False},
+            auto_ingest_on_mount=False,
+        )
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+
+            # Press 'm' to trigger the Matrix Defrag ingestion.
+            await pilot.press("m")
+            for _ in range(30):
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                if app._defrag_widget is not None:
+                    break
+
+            assert app._defrag_active is True
+            assert isinstance(app._defrag_widget, MatrixDefragCanvas)
+
+            # Wait for completion.
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                if not app._defrag_active:
+                    break
+
+            assert app._defrag_active is False
+            assert app._defrag_widget is None
+
+            conn = db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM commands")
+            assert cursor.fetchone()[0] == 5
+
+
+@pytest.mark.asyncio
+async def test_tui_matrix_defrag_no_extra_ui_panels(monkeypatch):
+    """The Matrix Defrag animation must not add any extra UI panels beyond the
+    DetailsCanvas takeover. The StatsHeader, NavigationTree, and Footer must
+    remain intact and unchanged.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        db_path = os.path.join(tmp_dir, "test.db")
+        db = Database(db_path)
+        db.init_db()
+
+        monkeypatch.setattr("termstory.parser.parse_all_histories", lambda *a, **kw: [])
+        monkeypatch.setattr("termstory.session.create_sessions", lambda cmds: [])
+        monkeypatch.setattr("termstory.project.detect_projects", lambda sessions: [])
+        monkeypatch.setattr("termstory.config.get_history_files", lambda: ["/tmp/fake_zsh_history"])
+        monkeypatch.setattr("termstory.cli.discover_project_paths", lambda: [])
+        monkeypatch.setattr("termstory.git_integration.get_project_commits", lambda *a, **kw: [])
+        monkeypatch.setattr("termstory.tags.auto_tag_all_sessions", lambda db: None)
+        monkeypatch.setattr("termstory.mcp_snapshot.capture_and_store_mcp_snapshot", lambda db: None)
+        monkeypatch.setattr("termstory.reminder.start_sleep_daemon", lambda db_path: None)
+
+        app = TermStoryWorkspace(
+            db,
+            days_limit=30,
+            config_override={"has_seen_onboarding": True, "ai_enabled": False},
+            auto_ingest_on_mount=True,
+        )
+
+        from textual.css.query import NoMatches
+
+        async with app.run_test(size=(120, 40)) as pilot:
+            # Wait for the auto-trigger to fire and install the widget.
+            for _ in range(30):
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                if app._defrag_widget is not None:
+                    break
+
+            # Give the mount cycle an extra refresh cycle to complete so the
+            # widget is fully queryable in the DOM. Without this, Python 3.11's
+            # event-loop scheduling can race ahead of Textual's async mount.
+            await pilot.pause()
+            await asyncio.sleep(0.02)
+
+            # The DetailsCanvas should be the ONLY place where the MatrixDefragCanvas
+            # lives — it must not be added as a sibling modal/screen.
+            assert app._defrag_widget is not None
+
+            # The master-layout Grid should still contain exactly the same children
+            # (StatsHeader, NavigationTree, DetailsCanvas) — no extra panels.
+            try:
+                stats = app.query_one("#stats-panel")
+                tree = app.query_one("#history-navigator")
+                details = app.query_one("#details-canvas")
+                assert stats is not None
+                assert tree is not None
+                assert details is not None
+            except NoMatches:
+                pytest.fail("Core layout panels missing during Matrix Defrag animation.")
+
+            # The MatrixDefragCanvas must be queryable by ID *from the
+            # DetailsCanvas* (i.e. mounted as a descendant, not as a sibling
+            # modal/screen). Using query_one rather than walk_children() is
+            # robust against Textual's internal scroll-container wrapping.
+            try:
+                mounted = details.query_one("#matrix-defrag-canvas")
+            except NoMatches:
+                pytest.fail(
+                    "MatrixDefragCanvas not mounted as a descendant of DetailsCanvas."
+                )
+            assert mounted is app._defrag_widget
+
+            # Negative assertions: the widget must NOT have leaked into sibling
+            # panels (StatsHeader / NavigationTree).
+            try:
+                stats.query_one("#matrix-defrag-canvas")
+                pytest.fail("MatrixDefragCanvas leaked into StatsHeader.")
+            except NoMatches:
+                pass
+            try:
+                tree.query_one("#matrix-defrag-canvas")
+                pytest.fail("MatrixDefragCanvas leaked into NavigationTree.")
+            except NoMatches:
+                pass
+
+            # Allow completion so the test tears down cleanly.
+            for _ in range(60):
+                await pilot.pause()
+                await asyncio.sleep(0.05)
+                if not app._defrag_active:
+                    break
+            # Final pause to drain any _finish_defrag cleanup messages before
+            # the test app is torn down (avoids noisy stderr during teardown).
+            await pilot.pause()

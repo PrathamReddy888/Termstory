@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## Added
+
+* **"The Matrix Defrag" Data-Ingestion Animation (#41):**
+  * **Triggers:** Automatically on first boot (empty DB), during large batch ingestion (history file > 1 MB), manually via `termstory ui --matrix`, or on-demand inside the TUI via the `m` key.
+  * **Visual Stream:** Replaces the standard progress bar with a cascading Matrix-style data stream taking over the entire `DetailsCanvas`. Displays raw shell commands interlaced with `0x........` hex codes scrolling in dim green/cyan.
+  * **DB Lock Effect:** As commands are locked into the SQLite DB via `db.save_data()`, corresponding lines "snap" into bright white readable text for a split second before scrolling away.
+  * **Architecture:** The full ingestion pipeline runs in a `@work(thread=True, exclusive=True)` background worker, with all UI mutations safely marshalled back onto the Textual UI thread via `app.call_from_thread`.
+
 ### Fixed
 - **`save_data` sentinel/pruning follow-up (#138)**: The unique index on `sessions(start_time, COALESCE(project_id, -1))` treated a hypothetical `project_id = -1` row as identical to `project_id IS NULL`; replaced with two partial unique indexes (`idx_sessions_start_time_with_project`, `idx_sessions_start_time_no_project`) so no sentinel value is needed. The dedup migration was split into two passes to match. Also scoped the orphan-session prune in `save_data` to sessions that share a `start_time` with another session, instead of deleting every command-less session. The old predicate could remove a legitimately empty, non-duplicate session. The unguarded `row[0]` in the same conflict-recovery path (also reported in #138) already had a `None` guard and regression test from a prior fix, no change needed there.
 
