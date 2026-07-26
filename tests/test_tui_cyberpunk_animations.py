@@ -30,7 +30,7 @@ import pytest
 from termstory.models import Command, Project, Session
 from termstory.tui import (
     EIGHT_HOURS_SECONDS,
-    GLITCH_FRAMES,
+    GLITCH_TICKS,
     StatsHeader,
     _glitch_string,
     _compute_highlight_days,
@@ -318,13 +318,18 @@ def test_glitch_string_is_random():
 
 # ────────────────────────────────────────────────────────────────────────────
 # 6. StatsHeader — glitch state machine
+#
+# The glitch is driven by the existing step_heatmap_pulse() interval (0.5s),
+# NOT by set_timer. When a new streak record is detected, _glitch_ticks_remaining
+# is set to GLITCH_TICKS. Each subsequent update_stats() call decrements it
+# and renders glitch text until it reaches 0, at which point the real streak
+# number is shown.
 # ────────────────────────────────────────────────────────────────────────────
 
 
 def test_stats_header_no_glitch_on_first_update():
     """The first update_stats call must NOT trigger a glitch (baseline set only)."""
     sh = StatsHeader(id="test-stats")
-    # Simulate a stats update — should set the baseline without glitching.
     sh.update_stats({
         "streak": 5,
         "total_time": "10m",
@@ -337,18 +342,14 @@ def test_stats_header_no_glitch_on_first_update():
         "highlight_days": set(),
         "pulse_active": False,
     })
-    assert sh._glitching is False
+    assert sh._glitch_ticks_remaining == 0
     assert sh._all_time_best_streak == 5
     assert sh._displayed_streak == 5
 
 
-def test_stats_header_glitch_triggers_on_new_record(monkeypatch):
-    """A strict streak increase from a known baseline must set _glitching=True."""
+def test_stats_header_glitch_triggers_on_new_record():
+    """A strict streak increase from a known baseline must set _glitch_ticks_remaining > 0."""
     sh = StatsHeader(id="test-stats")
-    # Stub out set_timer so it doesn't try to schedule on an unmounted widget.
-    monkeypatch.setattr(sh, "set_timer", lambda interval, cb: None)
-    # is_mounted is a read-only property; patch the class property to return True.
-    monkeypatch.setattr(StatsHeader, "is_mounted", property(lambda self: True), raising=False)
 
     # First call: establishes baseline at 3.
     sh.update_stats({
@@ -356,15 +357,15 @@ def test_stats_header_glitch_triggers_on_new_record(monkeypatch):
         "projects_count": 1, "heatmap": "░", "last_ingestion": "",
         "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
     })
-    assert sh._glitching is False
+    assert sh._glitch_ticks_remaining == 0
 
-    # Second call: new record (3 → 7) → glitch should fire.
+    # Second call: new record (3 → 7) → glitch should start.
     sh.update_stats({
         "streak": 7, "total_time": "20m", "active_days": 2,
         "projects_count": 1, "heatmap": "░", "last_ingestion": "",
         "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
     })
-    assert sh._glitching is True
+    assert sh._glitch_ticks_remaining > 0
     assert sh._all_time_best_streak == 7
     assert sh._displayed_streak == 7
 
@@ -382,7 +383,7 @@ def test_stats_header_no_glitch_on_equal_streak():
         "projects_count": 1, "heatmap": "░", "last_ingestion": "",
         "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
     })
-    assert sh._glitching is False
+    assert sh._glitch_ticks_remaining == 0
 
 
 def test_stats_header_no_glitch_on_lower_streak():
@@ -398,45 +399,38 @@ def test_stats_header_no_glitch_on_lower_streak():
         "projects_count": 1, "heatmap": "░", "last_ingestion": "",
         "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
     })
-    assert sh._glitching is False
+    assert sh._glitch_ticks_remaining == 0
     assert sh._all_time_best_streak == 5  # baseline unchanged
     assert sh._displayed_streak == 3      # but displayed value tracks current
 
 
-def test_stats_header_glitch_settles_after_all_frames(monkeypatch):
-    """_run_glitch_frame(GLITCH_FRAMES) must clear _glitching and call _render_header."""
+def test_stats_header_glitch_settles_after_ticks():
+    """After GLITCH_TICKS update_stats calls, the glitch must settle (ticks == 0)."""
     sh = StatsHeader(id="test-stats")
-    monkeypatch.setattr(sh, "set_timer", lambda interval, cb: None)
-    monkeypatch.setattr(StatsHeader, "is_mounted", property(lambda self: True), raising=False)
 
-    sh._last_stats = {
+    # Establish baseline.
+    sh.update_stats({
+        "streak": 3, "total_time": "10m", "active_days": 1,
+        "projects_count": 1, "heatmap": "░", "last_ingestion": "",
+        "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
+    })
+    # Trigger glitch with a new record.
+    sh.update_stats({
         "streak": 7, "total_time": "20m", "active_days": 2,
         "projects_count": 1, "heatmap": "░", "last_ingestion": "",
         "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
-    }
-    sh._displayed_streak = 7
-    sh._glitching = True
+    })
+    assert sh._glitch_ticks_remaining > 0
 
-    # Simulate the final frame — should clear _glitching.
-    sh._run_glitch_frame(GLITCH_FRAMES)
-    assert sh._glitching is False
-
-
-def test_stats_header_glitch_frame_does_not_crash_on_unmounted_widget():
-    """If the widget is unmounted mid-glitch, _run_glitch_frame must bail safely."""
-    sh = StatsHeader(id="test-stats")
-    sh._last_stats = {
-        "streak": 7, "total_time": "20m", "active_days": 2,
-        "projects_count": 1, "heatmap": "░", "last_ingestion": "",
-        "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
-    }
-    sh._displayed_streak = 7
-    sh._glitching = True
-
-    # is_mounted is False by default (never mounted) — should bail, not crash.
-    sh._run_glitch_frame(3)
-    assert sh._glitching is False
-
+    # Simulate GLITCH_TICKS more update_stats calls (from step_heatmap_pulse).
+    # Each call should decrement _glitch_ticks_remaining until it reaches 0.
+    for _ in range(GLITCH_TICKS):
+        sh.update_stats({
+            "streak": 7, "total_time": "20m", "active_days": 2,
+            "projects_count": 1, "heatmap": "░", "last_ingestion": "",
+            "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
+        })
+    assert sh._glitch_ticks_remaining == 0
 
 # ────────────────────────────────────────────────────────────────────────────
 # 7. StatsHeader — pulse_active colours the "Time logged" text
