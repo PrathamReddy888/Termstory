@@ -888,28 +888,56 @@ class StatsHeader(Static):
         self._displayed_streak = new_streak
         self._render_header()
 
+    def _on_unmount(self) -> None:
+        """Clean up any pending glitch timer when the widget is removed.
+
+        Without this, a pending ``set_timer`` callback can fire after the
+        widget (or the whole app) has been torn down, producing
+        ``NoMatches`` errors on ``query_one`` and ``Task was destroyed but
+        it is pending!`` warnings in the asyncio event loop.
+        """
+        self._glitching = False
+        # No explicit timer handle to cancel — Textual's set_timer returns
+        # None. Setting _glitching=False makes the next _run_glitch_frame
+        # (if it fires) bail immediately via the is_mounted guard.
+        try:
+            super()._on_unmount()
+        except Exception:
+            pass
+
     def _run_glitch_frame(self, frame_idx: int) -> None:
         """Render one frame of the streak glitch, then schedule the next.
 
         After ``GLITCH_FRAMES`` frames, settles on the real streak value.
+
+        This method is called via ``set_timer`` callbacks, which can fire
+        after the widget or app has been torn down (especially in tests).
+        The entire body is wrapped in a try/except to absorb any rendering
+        errors during teardown — a partially-torn-down widget is not worth
+        crashing the event loop over.
         """
-        # Guard against the widget being unmounted mid-glitch (e.g. the app
-        # closed or the test ended). Calling self.update() on an unmounted
-        # widget raises 'NoneType' object has no attribute 'render_strips'.
-        if self._last_stats is None or not self.is_mounted:
+        try:
+            # Guard against the widget being unmounted mid-glitch (e.g. the app
+            # closed or the test ended). Calling self.update() on an unmounted
+            # widget raises 'NoneType' object has no attribute 'render_strips'.
+            if self._last_stats is None or not self.is_mounted or not self._glitching:
+                self._glitching = False
+                return
+
+            if frame_idx >= GLITCH_FRAMES:
+                # Settle.
+                self._glitching = False
+                self._render_header()
+                return
+
+            # Render with a glitched streak string for this frame.
+            self._render_header(glitch_streak=_glitch_string(str(self._displayed_streak), len(str(self._displayed_streak))))
+            self.set_timer(GLITCH_FRAME_INTERVAL, lambda: self._run_glitch_frame(frame_idx + 1))
+        except Exception:
+            # Swallow any error during teardown — the glitch is cosmetic and
+            # should never crash the app or the test suite.
             self._glitching = False
-            return
-
-        if frame_idx >= GLITCH_FRAMES:
-            # Settle.
-            self._glitching = False
-            self._render_header()
-            return
-
-        # Render with a glitched streak string for this frame.
-        self._render_header(glitch_streak=_glitch_string(str(self._displayed_streak), len(str(self._displayed_streak))))
-        self.set_timer(GLITCH_FRAME_INTERVAL, lambda: self._run_glitch_frame(frame_idx + 1))
-
+            
     def _render_header(self, glitch_streak: Optional[str] = None) -> None:
         """Build and push the full StatsHeader markup.
 
@@ -2844,10 +2872,34 @@ class TermStoryWorkspace(App):
 
     def update_stats_header(self) -> None:
         pulse = getattr(self, "pulse_phase", 0)
-        stats = calculate_dashboard_stats(self.sessions, self.projects, days_limit=self.days_limit or 90, pulse_phase=pulse)
+        # Issue #42: highlight_days only changes when sessions change, not on
+        # every pulse tick. Cache it on the app instance and only recompute
+        # when the session count changes (a cheap proxy for "sessions changed").
+        # This avoids re-iterating all sessions every 0.5s — important for not
+        # perturbing the timing of background worker threads (e.g. the exec
+        # review worker) on slower Python versions (3.9/3.10).
+        real_sessions = [s for s in self.sessions if not getattr(s, "is_legacy", False)]
+        session_count = len(real_sessions)
+        if (
+            not hasattr(self, "_cached_highlight_days")
+            or getattr(self, "_cached_highlight_session_count", -1) != session_count
+        ):
+            day_counts = defaultdict(int)
+            for s in real_sessions:
+                day_counts[datetime.fromtimestamp(s.start_time).date()] += len(s.commands)
+            self._cached_highlight_days = _compute_highlight_days(day_counts, real_sessions)
+            self._cached_highlight_session_count = session_count
+
+        stats = calculate_dashboard_stats(
+            self.sessions, self.projects,
+            days_limit=self.days_limit or 90,
+            pulse_phase=pulse,
+            highlight_days=self._cached_highlight_days,
+        )
+
         ai_enabled = self.config.get("ai_enabled", False)
         provider = self.config.get("active_provider", "disabled")
-        
+
         if not ai_enabled or provider == "disabled":
             ai_status = "[dim]AI: DISABLED[/dim]"
         else:
@@ -2856,13 +2908,12 @@ class TermStoryWorkspace(App):
                 ai_status = f"[bold yellow]AI: ACTIVE ({provider.upper()}) (⏳ Summarizing...)[/bold yellow]"
             else:
                 ai_status = f"[bold cyan]AI: ACTIVE ({provider.upper()})[/bold cyan]"
-                
+
         try:
             from textual.css.query import NoMatches
             self.query_one("#stats-panel").update_stats(stats, ai_status=ai_status, days_limit=self.days_limit)
         except NoMatches:
             pass
-
     def update_session_ui(self, session_id: int, new_summary: str, skip_canvas_refresh: bool = False) -> None:
         """Update tree node label and refresh details canvas if necessary. Safe to run on main thread."""
         tree = self.query_one("#history-navigator")
