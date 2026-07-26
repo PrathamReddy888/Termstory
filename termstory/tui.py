@@ -777,11 +777,18 @@ class OnboardingScreen(_DeferredDismissMixin, ModalScreen[dict]):
 # Issue #42 — "Heatmap Pulse & Cyber-Glitch"
 #
 # Glitch effect parameters for the streak counter when an all-time record is
-# set. The glitch runs for ~0.5s (10 frames × 50ms) and then settles on the
-# real number. Driven by one-shot set_timer() calls so it does NOT conflict
-# with the existing 0.5s heatmap pulse_interval.
-GLITCH_FRAMES = 10
-GLITCH_FRAME_INTERVAL = 0.05  # seconds — 10 × 50ms = 500ms total
+# set. The glitch runs for ~0.5s (1 pulse tick) and then settles on the real
+# number.
+#
+# IMPORTANT: The glitch is driven by the EXISTING step_heatmap_pulse()
+# set_interval(0.5s) timer — it does NOT create any new set_timer() calls.
+# This is critical because Textual's set_timer creates an asyncio Task that
+# is NOT cancelled on app teardown, producing "Task was destroyed but it is
+# pending!" warnings and, on some Python versions (3.11/3.12), causing
+# NoMatches errors when the callback fires on a torn-down widget. By piggy-
+# backing on the existing interval, we add zero new timer tasks to the
+# event loop.
+GLITCH_TICKS = 1  # number of 0.5s pulse ticks the glitch lasts (~0.5s total)
 # ASCII characters used for the glitch scramble. Restricted to printable
 # ASCII digits/symbols so the streak counter width stays stable (avoids
 # layout jitter from wide CJK or emoji glyphs).
@@ -814,13 +821,13 @@ class StatsHeader(Static):
       * **Streak glitch on all-time record** — ``update_stats()`` tracks the
         highest streak it has ever seen across the app's lifetime (in-memory
         only; not persisted). When a new record arrives, the streak counter
-        runs a ~0.5s glitch: 10 frames of random ASCII characters at 50ms
-        each, then settles on the actual number. The glitch is driven by
-        one-shot ``set_timer`` calls so it doesn't interfere with the 0.5s
-        heatmap pulse interval.
+        shows random ASCII characters for ~0.5s (1 pulse tick) before
+        settling on the actual number.
 
     Both effects are pure Rich-markup changes — no new widgets, no new CSS
-    layout, no external dependencies.
+    layout, no external dependencies, and NO new timers. The glitch is
+    driven by the existing ``step_heatmap_pulse`` interval so it adds zero
+    asyncio tasks to the event loop.
     """
 
     def __init__(self, *args, **kwargs) -> None:
@@ -834,12 +841,13 @@ class StatsHeader(Static):
         # through random ASCII; when the glitch ends, this is the settled
         # value.
         self._displayed_streak: int = 0
-        # True while a glitch animation is in progress — used to short-circuit
-        # re-entrancy so a rapid stats refresh doesn't restart the glitch.
-        self._glitching: bool = False
-        # The most recent stats dict — kept so that timer-driven glitch
-        # frames can re-render the full StatsHeader content without the
-        # caller having to re-supply it.
+        # Remaining pulse ticks for the glitch. When > 0, the streak counter
+        # shows glitch text. Decremented on each update_stats() call (which
+        # happens every 0.5s via step_heatmap_pulse). NO set_timer involved.
+        self._glitch_ticks_remaining: int = 0
+        # The most recent stats dict — kept so that glitch frames can
+        # re-render the full StatsHeader content without the caller having
+        # to re-supply it.
         self._last_stats: Optional[Dict[str, Any]] = None
         self._last_ai_status: str = ""
         self._last_days_limit: Optional[int] = 30
@@ -851,6 +859,10 @@ class StatsHeader(Static):
         highest streak previously seen by this StatsHeader instance.
         Applies the magenta→pink pulse to "Time logged" when
         ``stats['pulse_active']`` is True.
+
+        The glitch is driven by subsequent ``update_stats()`` calls (which
+        happen every 0.5s via ``step_heatmap_pulse``) — no ``set_timer``
+        is used, so there are no pending timer tasks to leak on teardown.
         """
         self._last_stats = stats
         self._last_ai_status = ai_status
@@ -869,16 +881,13 @@ class StatsHeader(Static):
         if is_new_record:
             self._all_time_best_streak = new_streak
             self._displayed_streak = new_streak
-            # Kick off the one-shot glitch. Don't re-enter if one is already
-            # running — the in-flight glitch will settle on the latest value
-            # via _last_stats.
-            if not self._glitching:
-                self._glitching = True
-                self._run_glitch_frame(0)
-            else:
-                # Already glitching — just re-render with the latest stats so
-                # the non-streak fields stay current.
-                self._render_header()
+            # Start the glitch: show random ASCII for GLITCH_TICKS pulse
+            # ticks. The glitch is advanced by subsequent update_stats()
+            # calls (from step_heatmap_pulse), NOT by set_timer.
+            self._glitch_ticks_remaining = GLITCH_TICKS
+            self._render_header(glitch_streak=_glitch_string(
+                str(new_streak), len(str(new_streak))
+            ))
             return
 
         # Establish / maintain the baseline best on the first call (and any
@@ -886,58 +895,17 @@ class StatsHeader(Static):
         if new_streak > self._all_time_best_streak:
             self._all_time_best_streak = new_streak
         self._displayed_streak = new_streak
-        self._render_header()
 
-    def _on_unmount(self) -> None:
-        """Clean up any pending glitch timer when the widget is removed.
+        # Advance any in-progress glitch. When ticks run out, the next
+        # _render_header() call shows the real streak number.
+        if self._glitch_ticks_remaining > 0:
+            self._glitch_ticks_remaining -= 1
+            self._render_header(glitch_streak=_glitch_string(
+                str(self._displayed_streak), len(str(self._displayed_streak))
+            ))
+        else:
+            self._render_header()
 
-        Without this, a pending ``set_timer`` callback can fire after the
-        widget (or the whole app) has been torn down, producing
-        ``NoMatches`` errors on ``query_one`` and ``Task was destroyed but
-        it is pending!`` warnings in the asyncio event loop.
-        """
-        self._glitching = False
-        # No explicit timer handle to cancel — Textual's set_timer returns
-        # None. Setting _glitching=False makes the next _run_glitch_frame
-        # (if it fires) bail immediately via the is_mounted guard.
-        try:
-            super()._on_unmount()
-        except Exception:
-            pass
-
-    def _run_glitch_frame(self, frame_idx: int) -> None:
-        """Render one frame of the streak glitch, then schedule the next.
-
-        After ``GLITCH_FRAMES`` frames, settles on the real streak value.
-
-        This method is called via ``set_timer`` callbacks, which can fire
-        after the widget or app has been torn down (especially in tests).
-        The entire body is wrapped in a try/except to absorb any rendering
-        errors during teardown — a partially-torn-down widget is not worth
-        crashing the event loop over.
-        """
-        try:
-            # Guard against the widget being unmounted mid-glitch (e.g. the app
-            # closed or the test ended). Calling self.update() on an unmounted
-            # widget raises 'NoneType' object has no attribute 'render_strips'.
-            if self._last_stats is None or not self.is_mounted or not self._glitching:
-                self._glitching = False
-                return
-
-            if frame_idx >= GLITCH_FRAMES:
-                # Settle.
-                self._glitching = False
-                self._render_header()
-                return
-
-            # Render with a glitched streak string for this frame.
-            self._render_header(glitch_streak=_glitch_string(str(self._displayed_streak), len(str(self._displayed_streak))))
-            self.set_timer(GLITCH_FRAME_INTERVAL, lambda: self._run_glitch_frame(frame_idx + 1))
-        except Exception:
-            # Swallow any error during teardown — the glitch is cosmetic and
-            # should never crash the app or the test suite.
-            self._glitching = False
-            
     def _render_header(self, glitch_streak: Optional[str] = None) -> None:
         """Build and push the full StatsHeader markup.
 
@@ -997,7 +965,6 @@ class StatsHeader(Static):
             f"{ai_status}{ingestion_str}\n"
             f"[dim]Activity ({limit_str}):[/dim] {stats['heatmap']}"
         )
-
 
 class NavigationTree(Tree):
     """Collapsible date-grouped navigation timeline supporting Vim keys."""
