@@ -896,13 +896,19 @@ class StatsHeader(Static):
             self._all_time_best_streak = new_streak
         self._displayed_streak = new_streak
 
-        # Advance any in-progress glitch. When ticks run out, the next
-        # _render_header() call shows the real streak number.
+        # Advance any in-progress glitch. When ticks hit 0, render the real
+        # number IMMEDIATELY (not on the next tick) so the glitch lasts
+        # exactly GLITCH_TICKS × 0.5s — no extra pulse of glitch text.
         if self._glitch_ticks_remaining > 0:
             self._glitch_ticks_remaining -= 1
-            self._render_header(glitch_streak=_glitch_string(
-                str(self._displayed_streak), len(str(self._displayed_streak))
-            ))
+            if self._glitch_ticks_remaining > 0:
+                # Still glitching — show random ASCII
+                self._render_header(glitch_streak=_glitch_string(
+                    str(self._displayed_streak), len(str(self._displayed_streak))
+                ))
+            else:
+                # Glitch just ended — show the real number NOW
+                self._render_header()
         else:
             self._render_header()
 
