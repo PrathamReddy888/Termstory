@@ -33,6 +33,7 @@ from termstory.tui import (
     GLITCH_TICKS,
     StatsHeader,
     _glitch_string,
+    _GLITCH_CHARS,
     _compute_highlight_days,
     calculate_dashboard_stats,
     calculate_streak,
@@ -431,6 +432,50 @@ def test_stats_header_glitch_settles_after_ticks():
             "vampire_index": 0, "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
         })
     assert sh._glitch_ticks_remaining == 0
+
+
+def test_stats_header_glitch_settles_on_correct_tick_not_one_late():
+    """PR #368 review fix: the glitch must settle (show the real streak
+    number) on the SAME tick that _glitch_ticks_remaining hits 0 — NOT one
+    tick later.
+
+    Before the fix, the code rendered glitch text even after decrementing
+    to 0, making the glitch last GLITCH_TICKS+1 ticks instead of
+    GLITCH_TICKS ticks.
+    """
+    sh = StatsHeader(id="test-stats")
+
+    # Capture what _render_header sends to self.update().
+    rendered_content = []
+    sh.update = lambda c: rendered_content.append(str(c))  # type: ignore[assignment]
+
+    stats_base = {
+        "total_time": "10m", "active_days": 1, "projects_count": 1,
+        "heatmap": "░", "last_ingestion": "", "vampire_index": 0,
+        "rpg_class": "T", "highlight_days": set(), "pulse_active": False,
+    }
+
+    # 1. Establish baseline at streak=3.
+    sh.update_stats({**stats_base, "streak": 3})
+    assert sh._glitch_ticks_remaining == 0
+
+    # 2. Trigger glitch with new record (3 → 7).
+    rendered_content.clear()
+    sh.update_stats({**stats_base, "streak": 7})
+    assert sh._glitch_ticks_remaining == GLITCH_TICKS  # 1
+    # The record-triggering call must render glitch text.
+    assert len(rendered_content) == 1
+    glitch_render = rendered_content[0]
+    assert "7" not in glitch_render or any(c in glitch_render for c in _GLITCH_CHARS)
+
+    # 3. Next tick (0.5s later): glitch must settle IMMEDIATELY.
+    rendered_content.clear()
+    sh.update_stats({**stats_base, "streak": 7})
+    assert sh._glitch_ticks_remaining == 0
+    # The settle tick must render the REAL streak number, not glitch text.
+    assert len(rendered_content) == 1
+    settle_render = rendered_content[0]
+    assert "7" in settle_render  # real streak number visible
 
 # ────────────────────────────────────────────────────────────────────────────
 # 7. StatsHeader — pulse_active colours the "Time logged" text
