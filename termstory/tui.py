@@ -138,6 +138,14 @@ def _compute_highlight_days(day_counts: dict, sessions: List[Session]) -> set:
 
     Returns an empty set when there is no activity at all (so the pulse has
     nothing to highlight — the scan-line effect still runs on its own).
+
+    TODO: When ``days_limit`` is ``None`` ("All History" mode), the
+    personal-best computation scans the ENTIRE session history rather than
+    a bounded window. This is correct but may produce surprising results
+    for long-time users (a single prolific day months ago suppresses all
+    other days). A follow-up PR could scope the personal-best to the
+    visible window only. Out of scope for this PR — requires threading
+    ``days_limit`` through the call chain.
     """
     if not day_counts:
         return set()
