@@ -2895,6 +2895,7 @@ class TermStoryWorkspace(App):
             self.query_one("#stats-panel").update_stats(stats, ai_status=ai_status, days_limit=self.days_limit)
         except NoMatches:
             pass
+            
     def update_session_ui(self, session_id: int, new_summary: str, skip_canvas_refresh: bool = False) -> None:
         """Update tree node label and refresh details canvas if necessary. Safe to run on main thread."""
         tree = self.query_one("#history-navigator")
