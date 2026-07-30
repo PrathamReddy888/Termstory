@@ -392,7 +392,24 @@ class TestCliAgyCommand:
         monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/agy")
         monkeypatch.setattr("termstory.agy.find_agy", lambda: "/usr/local/bin/agy")
         monkeypatch.setattr("termstory.cli.run_ingestion", lambda db: None)
+
         captured = []
+        captured_content = []
+
+        def mock_run(cmd, **kwargs):
+            captured.append(cmd)
+            # Read the context file NOW — launch_agy deletes it in a
+            # finally block after subprocess.run returns.
+            with open(cmd[2]) as f:
+                captured_content.append(f.read())
+            return subprocess.CompletedProcess(cmd, 0)
+
+        monkeypatch.setattr("subprocess.run", mock_run)
+
+        result = runner.invoke(app, ["agy", "--num-commands", "5"])
+        assert result.exit_code == 0
+        assert len(captured) == 1
+        assert "git status" in captured_content[0]
 
         def mock_run(cmd, **kwargs):
             captured.append(cmd)
