@@ -307,12 +307,13 @@ class TestLaunchAgy:
 
 
 class TestRunAgyBridge:
-    def test_returns_error_when_agy_not_installed(self, monkeypatch, populated_db):
+    def test_returns_error_when_agy_not_installed(self, monkeypatch):
         monkeypatch.setattr("termstory.agy.find_agy", lambda: None)
         monkeypatch.setattr("shutil.which", lambda cmd: None)
+
         code = run_agy_bridge()
         assert code == EXIT_AGY_NOT_FOUND
-
+      
     def test_no_context_mode_skips_db(self, monkeypatch):
         monkeypatch.setattr("termstory.agy.find_agy", lambda: "/usr/local/bin/agy")
         called = []
