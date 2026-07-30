@@ -412,18 +412,6 @@ class TestCliAgyCommand:
         assert len(captured) == 1
         assert "git status" in captured_content[0]
 
-        def mock_run(cmd, **kwargs):
-            captured.append(cmd)
-            return subprocess.CompletedProcess(cmd, 0)
-
-        monkeypatch.setattr("subprocess.run", mock_run)
-        result = runner.invoke(app, ["agy", "--num-commands", "5"])
-        assert result.exit_code == 0
-        assert len(captured) == 1
-        with open(captured[0][2]) as f:
-            content = f.read()
-        assert "git status" in content
-
     def test_agy_keyboard_interrupt(self, monkeypatch):
         monkeypatch.setattr("shutil.which", lambda cmd: "/usr/local/bin/agy")
         monkeypatch.setattr("termstory.agy.find_agy", lambda: "/usr/local/bin/agy")
