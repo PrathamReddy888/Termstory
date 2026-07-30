@@ -135,20 +135,29 @@ class TestGatherRecentCommands:
         assert len(commands) == 3
 
     def test_redacts_secrets_in_commands(self, populated_db):
-        """Secrets in commands must be redacted before returning."""
+        """Secrets in commands must be redacted before returning.
+
+        Uses ``export DATABASE_PASSWORD=...`` because it contains a secret
+        but does NOT match any BLACKLIST_PATTERN (the blacklist's
+        ``\\bpassword\\b`` requires "password" as a standalone word, not as
+        a suffix of ``DATABASE_PASSWORD``).  This exercises the
+        ``redact_command`` path rather than the drop-entirely path.
+        """
         conn = populated_db.get_connection()
         cursor = conn.cursor()
         cursor.execute(
             "INSERT INTO commands (command, timestamp) VALUES (?, ?)",
-            ("curl https://user:secretpass@example.com/api", 1700000050),
+            ("export DATABASE_PASSWORD=SuperSecretValue456", 1700000050),
         )
         conn.commit()
         conn.close()
 
         commands = _gather_recent_commands(populated_db, limit=10)
-        curl_cmd = [c for c in commands if "curl" in c][0]
-        assert "secretpass" not in curl_cmd
-        assert "REDACTED" in curl_cmd
+        export_cmd = [c for c in commands if "DATABASE_PASSWORD" in c][0]
+        # The secret value must be gone...
+        assert "SuperSecretValue456" not in export_cmd
+        # ...replaced by the [REDACTED] marker.
+        assert "[REDACTED]" in export_cmd
 
     def test_empty_db_returns_empty_list(self, empty_db):
         commands = _gather_recent_commands(empty_db, limit=10)
